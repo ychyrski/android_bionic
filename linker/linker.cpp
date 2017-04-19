@@ -60,6 +60,9 @@
 #include "linker_relocs.h"
 #include "linker_reloc_iterators.h"
 #include "linker_utils.h"
+#ifdef ENABLE_NON_PIE_SUPPORT
+#include "linker_non_pie.h"
+#endif
 
 #include "android-base/strings.h"
 #include "ziparchive/zip_archive.h"
@@ -1255,8 +1258,7 @@ static void reset_g_active_shim_libs(void) {
   }
 }
 
-static void parse_LD_SHIM_LIBS(const char* path) {
-  g_ld_all_shim_libs.clear();
+static void parse_shim_libs(const char* path) {
   if (path != nullptr) {
     // We have historically supported ':' as well as ' ' in LD_SHIM_LIBS.
     for (const auto& pair : android::base::Split(path, " :")) {
@@ -1268,6 +1270,14 @@ static void parse_LD_SHIM_LIBS(const char* path) {
     }
   }
   reset_g_active_shim_libs();
+}
+
+static void parse_LD_SHIM_LIBS(const char* path) {
+  g_ld_all_shim_libs.clear();
+#ifdef FORCED_SHIM_LIBS
+  parse_shim_libs(FORCED_SHIM_LIBS);
+#endif
+  parse_shim_libs(path);
 }
 
 template<typename F>
@@ -2827,10 +2837,10 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
 
     const ElfW(Sym)* s = nullptr;
     soinfo* lsi = nullptr;
+    const version_info* vi = nullptr;
 
     if (sym != 0) {
       sym_name = get_string(symtab_[sym].st_name);
-      const version_info* vi = nullptr;
 
       if (!lookup_version_info(version_tracker, sym, sym_name, &vi)) {
         return false;
@@ -3141,6 +3151,41 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
          * R_ARM_COPY may only appear in executable objects where e_type is
          * set to ET_EXEC.
          */
+#ifdef ENABLE_NON_PIE_SUPPORT
+        if (allow_non_pie(get_realpath())) {
+          if ((flags_ & FLAG_EXE) == 0) {
+            DL_ERR("%s R_ARM_COPY relocations only supported for ET_EXEC", get_realpath());
+            return false;
+          }
+          count_relocation(kRelocCopy);
+          MARK(rel->r_offset);
+          TRACE_TYPE(RELO, "RELO %08x <- %d @ %08x %s", reloc, s->st_size, sym_addr, sym_name);
+          if (reloc == sym_addr) {
+            const ElfW(Sym)* src = nullptr;
+
+            if (!soinfo_do_lookup(NULL, sym_name, vi, &lsi, global_group, local_group, &src)) {
+              DL_ERR("%s R_ARM_COPY relocation source cannot be resolved", get_realpath());
+              return false;
+            }
+            if (lsi->has_DT_SYMBOLIC) {
+              DL_ERR("%s invalid R_ARM_COPY relocation against DT_SYMBOLIC shared "
+                     "library %s (built with -Bsymbolic?)", get_realpath(), lsi->soname_);
+              return false;
+            }
+            if (s->st_size < src->st_size) {
+              DL_ERR("%s R_ARM_COPY relocation size mismatch (%d < %d)",
+                     get_realpath(), s->st_size, src->st_size);
+              return false;
+            }
+            memcpy(reinterpret_cast<void*>(reloc),
+                   reinterpret_cast<void*>(src->st_value + lsi->load_bias), src->st_size);
+          } else {
+            DL_ERR("%s R_ARM_COPY relocation target cannot be resolved", get_realpath());
+            return false;
+          }
+          break;
+        }
+#endif
         DL_ERR("%s R_ARM_COPY relocations are not supported", get_realpath());
         return false;
 #elif defined(__i386__)
@@ -4348,11 +4393,20 @@ static ElfW(Addr) __linker_init_post_relocation(KernelArgumentBlock& args, ElfW(
   }
   si->dynamic = nullptr;
 
+#ifdef ENABLE_NON_PIE_SUPPORT
+  if (allow_non_pie(executable_path)) {
+    DL_WARN("Non position independent executable (non PIE) allowed: %s",
+            executable_path);
+  } else {
+#endif
   ElfW(Ehdr)* elf_hdr = reinterpret_cast<ElfW(Ehdr)*>(si->base);
   if (elf_hdr->e_type != ET_DYN) {
     __libc_fatal("\"%s\": error: only position independent executables (PIE) are supported.",
                  args.argv[0]);
   }
+#ifdef ENABLE_NON_PIE_SUPPORT
+  }
+#endif
 
   // Use LD_LIBRARY_PATH and LD_PRELOAD (but only if we aren't setuid/setgid).
   parse_LD_LIBRARY_PATH(ldpath_env);
